@@ -168,6 +168,28 @@ SIcons = struct( ...
     'Tooltip',     {'Open Files' , 'Import Workspace Variables', 'Save To Files',     'Delete', 'Print', 'Exchange', 'Change Layout', 'Colormap', 'Change Flow', 'Link Actions', 'Link Windowing','Reset View', 'Phase Image', 'Maximum Intensity Projection', 'Minimum Intensity Projection', 'Log Evaluation', 'Stop Logging Evaluation', 'Undo Last Evaluation', 'Eval Timeseries', 'Show Line/ROI Plots', 'Move/Zoom/Window', 'Rotate', 'Profile Evaluation', 'ROI Evaluation', 'Livewire ROI Evaluation', 'Region Growing Volume Evaluation', 'Isocontour Evaluation', 'Properties'});
 % -------------------------------------------------------------------------
 
+% --- 3D rotate patch ---
+SIcons(end+1).Name        = 'rotate3d';
+SIcons(end).Spacer        = 0;
+SIcons(end).GroupIndex    = -1;
+SIcons(end).Enabled       = 1;
+SIcons(end).Active        = 1;
+SIcons(end).Accelerator   = '';
+SIcons(end).Modifier      = '';
+SIcons(end).Tooltip       = '3D Rotate Volume';
+% --- end patch ---
+
+% --- Save rotation matrix patch ---
+SIcons(end+1).Name        = 'rotate3d_save';
+SIcons(end).Spacer        = 0;
+SIcons(end).GroupIndex    = -1;
+SIcons(end).Enabled       = 1;
+SIcons(end).Active        = 1;
+SIcons(end).Accelerator   = '';
+SIcons(end).Modifier      = '';
+SIcons(end).Tooltip       = 'Save 3D Rotation Matrix';
+% --- end patch ---
+
 % ------------------------------------------------------------------------
 % Reset the GUI's state variable
 SState.iLastSeries     = 0;
@@ -731,6 +753,10 @@ drawnow expose
                         end
                         fprintf('Removed entry %d from ''%s''!\n', iPosDel, SState.sEvalFilename);
                         fclose(fid);
+                    case 'rotate3d'
+                        fRotate3D();
+                    case 'rotate3d_save'
+                        fSaveRot3D();
    
                     % - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -1049,6 +1075,7 @@ drawnow expose
                 iStartSeries = SMouse.iStartAxis + SState.iStartSeries - 1;
                 for i = 1:length(SData)
                     if ~(lLinked || i == iStartSeries || SData(i).iGroupIndex == SData(iStartSeries).iGroupIndex), continue, end % Skip if axes not linked and current figure not active
+                    fEnsureOriOrig(i);
                     
                     switch get(hObject, 'SelectionType')
                         % - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -3438,7 +3465,313 @@ drawnow expose
     % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
     % * * END NESTED FUNCTION fCompileMex
 	% = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-    
+
+% = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fRotate3D (nested in imagine)
+    % * * Two-click line rotation, view-basis derived from sOri.
+    % * * One global rotation accumulator (SState.dRot3DMatrix), expressed
+    % * * in the original frame of the driver series.
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function fRotate3D()
+        if fIsOn('link')
+            iList = 1:numel(SData);
+        else
+            iList = find([SData.lActive]);
+        end
+        iList = iList(arrayfun(@(k) ndims(SData(k).dImg) >= 3, iList));
+        if isempty(iList)
+            set(STexts.hStatus, 'String', ...
+                'Rotate 3D: no 3D+ series in scope (enable link for all).');
+            return
+        end
+
+        iDriver = iList(1);
+        iAxDriver = iDriver - SState.iStartSeries + 1;
+        if iAxDriver < 1 || iAxDriver > length(SAxes.hImg)
+            set(STexts.hStatus, 'String', ...
+                'Rotate 3D: driver series not currently on-screen.');
+            return
+        end
+
+        % Snapshot baseline per series.
+        for k = 1:numel(iList)
+            i = iList(k);
+            fEnsureOriOrig(i);
+            SData(i).dRot3DBaseImg = SData(i).dImg;
+            if SData(i).lND
+                SData(i).dRot3DBaseAll = SData(i).dImgAll;
+            else
+                SData(i).dRot3DBaseAll = [];
+            end
+        end
+
+        % Single global accumulator of the oblique steps, in the driver's
+        % original (load-time) frame.
+        if ~isfield(SState, 'dRot3DMatrix') || isempty(SState.dRot3DMatrix)
+            SState.dRot3DMatrix = eye(3);
+        end
+        B = fRot3DBasisFromOri(SData(iDriver).sOriOrig, SData(iDriver).sOri);
+
+        % Stash callbacks + tool.
+        hOldDown = get(hF, 'WindowButtonDownFcn');
+        hOldMove = get(hF, 'WindowButtonMotionFcn');
+        hOldUp   = get(hF, 'WindowButtonUpFcn');
+        hOldKey  = get(hF, 'KeyPressFcn');
+        sOldTool = SState.sTool;
+        SState.sTool = '';
+
+        set(STexts.hStatus, 'String', ...
+            'Rotate 3D: click START point on driver panel (right-click / Esc = abort).');
+
+        iState = 0;
+        dX0 = 0; dY0 = 0;
+        hLine = [];
+
+        set(hF, 'WindowButtonDownFcn',   @fClick);
+        set(hF, 'WindowButtonMotionFcn', @fHover);
+        set(hF, 'WindowButtonUpFcn',     '');
+        set(hF, 'KeyPressFcn',           @fKey);
+
+        function fKey(~, ev)
+            if strcmp(ev.Key, 'escape'), fAbort(); end
+        end
+
+        function fClick(~,~)
+            if strcmp(get(hF, 'SelectionType'), 'alt')
+                fAbort(); return
+            end
+            iP = fGetPanel();
+            if iP ~= iAxDriver
+                set(STexts.hStatus, 'String', ...
+                    'Rotate 3D: click on the DRIVER panel (first in-scope series).');
+                return
+            end
+            dPos = get(SAxes.hImg(iAxDriver), 'CurrentPoint');
+            if iState == 0
+                dX0 = dPos(1,1); dY0 = dPos(1,2);
+                if ishandle(hLine), try, delete(hLine); catch, end, end
+                hLine = line([dX0 dX0], [dY0 dY0], ...
+                    'Parent', SAxes.hImg(iAxDriver), ...
+                    'Color', [1 1 0], 'LineWidth', 1.5, 'HitTest', 'off');
+                iState = 1;
+                set(STexts.hStatus, 'String', ...
+                    'Rotate 3D: click END point (right-click / Esc = abort).');
+            else
+                dX1 = dPos(1,1); dY1 = dPos(1,2);
+                dDX = dX1 - dX0; dDY = dY1 - dY0;
+                if ishandle(hLine), try, delete(hLine); catch, end, end
+                if hypot(dDX, dDY) < 5
+                    fAbort();
+                    set(STexts.hStatus, 'String', 'Rotate 3D: line too short, aborted.');
+                    return
+                end
+
+                dAng = atan2d(dDY, dDX);
+
+                V3 = fGetDriverBaseFrame();
+                SData(iDriver).dImg = fRot3D(V3, dAng);
+                SData(iDriver).iActiveImage = ...
+                    min(SData(iDriver).iActiveImage, size(SData(iDriver).dImg,3));
+                fFillPanels();
+
+                sAns = questdlg(sprintf('Rotate by %.2f°?\n\nYes = apply to all frames and all in-scope series.\nNo = revert.', dAng), ...
+                                'Rotate 3D', 'Yes', 'No', 'Yes');
+                if strcmp(sAns, 'Yes')
+                    fApplyAll(dAng);
+                else
+                    SData(iDriver).dImg = SData(iDriver).dRot3DBaseImg;
+                    SData(iDriver).iActiveImage = ...
+                        min(SData(iDriver).iActiveImage, size(SData(iDriver).dImg,3));
+                    fFillPanels();
+                end
+                fRestore();
+                set(STexts.hStatus, 'String', '');
+            end
+        end
+
+        function fHover(~,~)
+            if iState ~= 1 || ~ishandle(hLine), return, end
+            iP = fGetPanel();
+            if iP ~= iAxDriver, return, end
+            dPos = get(SAxes.hImg(iAxDriver), 'CurrentPoint');
+            set(hLine, 'XData', [dX0 dPos(1,1)], 'YData', [dY0 dPos(1,2)]);
+        end
+
+        function fAbort()
+            if ishandle(hLine), try, delete(hLine); catch, end, end
+            fRestore();
+            set(STexts.hStatus, 'String', 'Rotate 3D: aborted.');
+        end
+
+        function V3 = fGetDriverBaseFrame()
+            if SData(iDriver).lND
+                nd1 = SData(iDriver).iActiveND(1);
+                nd2 = SData(iDriver).iActiveND(2);
+                if ndims(SData(iDriver).dRot3DBaseAll) == 5
+                    V3 = SData(iDriver).dRot3DBaseAll(:,:,:,nd1,nd2);
+                else
+                    V3 = SData(iDriver).dRot3DBaseAll(:,:,:,nd1);
+                end
+            else
+                V3 = SData(iDriver).dRot3DBaseImg;
+            end
+        end
+
+        function fApplyAll(ang)
+            set(hF, 'Pointer', 'watch'); drawnow;
+            Rz = [cosd(ang) -sind(ang) 0; ...
+                  sind(ang)  cosd(ang) 0; ...
+                       0          0    1];
+            for kk = 1:numel(iList)
+                ii = iList(kk);
+                if SData(ii).lND
+                    SData(ii).dImgAll = fRot3D(SData(ii).dRot3DBaseAll, ang);
+                    if ndims(SData(ii).dImgAll) == 5
+                        SData(ii).dImg = SData(ii).dImgAll(:,:,:, ...
+                            SData(ii).iActiveND(1), SData(ii).iActiveND(2));
+                    else
+                        SData(ii).dImg = SData(ii).dImgAll(:,:,:, ...
+                            SData(ii).iActiveND(1));
+                    end
+                else
+                    SData(ii).dImg = fRot3D(SData(ii).dRot3DBaseImg, ang);
+                end
+                SData(ii).iActiveImage = ...
+                    min(SData(ii).iActiveImage, size(SData(ii).dImg,3));
+            end
+            % Accumulate: right-multiply (each step matrix is the transpose
+            % of the rotation imrotate3 applies, so order must be M*R).
+            SState.dRot3DMatrix = SState.dRot3DMatrix * (B * Rz * B');
+            set(hF, 'Pointer', 'arrow');
+            fFillPanels();
+        end
+
+        function fRestore()
+            set(hF, 'WindowButtonDownFcn',   hOldDown);
+            set(hF, 'WindowButtonMotionFcn', hOldMove);
+            set(hF, 'WindowButtonUpFcn',     hOldUp);
+            set(hF, 'KeyPressFcn',           hOldKey);
+            SState.sTool = sOldTool;
+        end
+    end
+
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fEnsureOriOrig (nested in imagine)
+    % * * Record the reference orientation of series i the first time it
+    % * * is needed (before any 90-degree turn or Rotate 3D step).
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function fEnsureOriOrig(i)
+        if ~isfield(SData, 'sOriOrig') || isempty(SData(i).sOriOrig)
+            SData(i).sOriOrig = SData(i).sOri;
+        end
+    end
+
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fRot3DBasisFromOri (nested in imagine)
+    % * * B such that R_orig = B * R_view * B'.
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function B = fRot3DBasisFromOri(sOriOrig, sOriNow)
+        vOrig = fOriToVecs(sOriOrig);
+        vNow  = fOriToVecs(sOriNow);
+        B = vOrig' * vNow;
+    end
+
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fOriToVecs (nested in imagine)
+    % * * 3x3 matrix, columns = view axes as unit vectors in physical frame.
+    % * * Physical: +x = L, +y = A, +z = H.
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function V = fOriToVecs(sOri)
+        V = zeros(3,3);
+        for a = 1:3
+            pair = sOri(2*a-1 : 2*a);
+            switch pair
+                case 'RL', V(:,a) = [-1; 0; 0]; case 'LR', V(:,a) = [ 1; 0; 0];
+                case 'AP', V(:,a) = [ 0; 1; 0]; case 'PA', V(:,a) = [ 0;-1; 0];
+                case 'FH', V(:,a) = [ 0; 0; 1]; case 'HF', V(:,a) = [ 0; 0;-1];
+                otherwise, error('Rotate 3D: unrecognized orientation code ''%s''', pair);
+            end
+        end
+    end
+
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fRot3D (nested in imagine)
+    % * * Rotate about through-plane axis [0 0 1]. Handles 3D/4D/5D and
+    % * * complex data. Preserves shape (uses 'crop').
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function Vout = fRot3D(V, ang)
+        if ang == 0 || isempty(V), Vout = V; return, end
+        sz  = size(V);
+        sz4 = 1; if numel(sz) >= 4, sz4 = sz(4); end
+        sz5 = 1; if numel(sz) >= 5, sz5 = sz(5); end
+        if isreal(V)
+            Vout = zeros(size(V), class(V));
+            for k5 = 1:sz5
+                for k4 = 1:sz4
+                    Vout(:,:,:,k4,k5) = imrotate3(V(:,:,:,k4,k5), ang, ...
+                        [0 0 1], 'cubic','crop','FillValues',0);
+                end
+            end
+        else
+            Vr = zeros(size(V), class(V));
+            Vi = zeros(size(V), class(V));
+            for k5 = 1:sz5
+                for k4 = 1:sz4
+                    Vr(:,:,:,k4,k5) = imrotate3(real(V(:,:,:,k4,k5)), ang, ...
+                        [0 0 1], 'cubic','crop','FillValues',0);
+                    Vi(:,:,:,k4,k5) = imrotate3(imag(V(:,:,:,k4,k5)), ang, ...
+                        [0 0 1], 'cubic','crop','FillValues',0);
+                end
+            end
+            Vout = complex(Vr, Vi);
+        end
+    end
+
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    % * * NESTED FUNCTION fSaveRot3D (nested in imagine)
+    % * * Save the complete 3D rotation R to .mat: all oblique Rotate 3D
+    % * * steps AND all 90-degree Rotate-tool turns, concatenated.
+    % * * Matrix is expressed in the ORIGINAL (load-time) data frame.
+    % = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+    function fSaveRot3D()
+        % Reference series: same rule as the Rotate 3D driver.
+        if fIsOn('link')
+            iList = 1:numel(SData);
+        else
+            iList = find([SData.lActive]);
+        end
+        iList = iList(arrayfun(@(k) ndims(SData(k).dImg) >= 3, iList));
+        if isempty(iList)
+            set(STexts.hStatus, 'String', 'Save Rot3D: no 3D+ series in scope.');
+            return
+        end
+        iRef = iList(1);
+        fEnsureOriOrig(iRef);
+
+        % Oblique part (eye(3) if no Rotate 3D step was applied).
+        if ~isfield(SState, 'dRot3DMatrix') || isempty(SState.dRot3DMatrix)
+            M = eye(3);
+        else
+            M = SState.dRot3DMatrix;
+        end
+
+        % 90-degree part: current array axes vs load-time array axes.
+        B = fRot3DBasisFromOri(SData(iRef).sOriOrig, SData(iRef).sOri);
+
+        Rfull = M * B;
+        if isequal(Rfull, eye(3))
+            set(STexts.hStatus, 'String', 'Save Rot3D: no rotations to save yet.');
+            return
+        end
+        [sFile, sPath] = uiputfile({'*.mat','MAT-file (*.mat)'}, ...
+            'Save 3D rotation matrix', [SState.sPath, filesep, 'rotation3D.mat']);
+        if isnumeric(sPath), return, end
+        SState.sPath = sPath;
+        R = Rfull; %#ok<NASGU>
+        save(fullfile(sPath, sFile), 'R');
+        set(STexts.hStatus, 'String', sprintf('Save Rot3D: wrote R to %s', sFile));
+    end
+
 end
 % =========================================================================
 % *** END FUNCTION imagine (and its nested functions)
